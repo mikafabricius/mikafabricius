@@ -4,7 +4,10 @@ using System.Linq;
 using System.IO;
 using System.Globalization;
 using System.Collections.Generic;
+using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
  
+
 public partial class Graph : Control
 {
 	public float[] dataNox = new float[] { };
@@ -25,6 +28,7 @@ public partial class Graph : Control
 	public float[] scalarMean = new float[] { };
 	public float[] scalarStd = new float[] { };
 	public string[] dataTime = new string[] { };
+	private InferenceSession session;
 	public static int count = 0;
 	private double time;
 	public Font defaultfont = ThemeDB.FallbackFont;
@@ -36,7 +40,7 @@ public partial class Graph : Control
 	public List<Vector2> data = new List<Vector2>();
 	public List<Vector2> scaledPoints = new List<Vector2>();
 	private readonly List<string> visibleTimes = new List<string>();
-	public float upperLimit = 110.0f;
+	public float upperLimit = 120.0f;
 	public Rect2 envelopeNOX;
 	public Color envelopeColor = new Color(0.862745f, 0.0784314f, 0.235294f, 0.3f);
  
@@ -63,7 +67,7 @@ public partial class Graph : Control
  
 	public override void _PhysicsProcess(double delta)
 	{
-		time += delta;
+		time += 2 * delta;
 		if (count < (int)time)
 		{
 			if (count > dataNox.Length - 1) return;
@@ -78,7 +82,7 @@ public partial class Graph : Control
 			}
 			else
 			{
-				// Slide window: drop leftmost, add newest
+				// FIFO
 				data.RemoveAt(0);
 				if (visibleTimes.Count > 0) visibleTimes.RemoveAt(0);
 				if (dataGlobalIdx.Count > 0) dataGlobalIdx.RemoveAt(0);
@@ -89,6 +93,35 @@ public partial class Graph : Control
 			}
  
 			Plot(data);
+
+			// Predict using data
+			float[] rawInput = new float[] {dataOvenTemp[count], dataT2S[count],
+									dataEBKTemp[count], dataNoxCalc[count], dataNox[count],
+									dataNoxSNCRFlow[count], dataNH3[count], dataSmoke02[count],
+									dataMainFume[count], dataNM3Flow[count], dataSmokeFlow[count],
+									dataPrimaryReg[count], dataPrimaryAirTemp[count], dataSecondaryOvenAir[count],
+									dataSecondaryFlow[count]};
+
+			float[] input = new float[rawInput.Length];
+			for (int i = 0; i < rawInput.Length; i++)
+			{
+				input[i] = (rawInput[i] - scalarMean[i]) / scalarStd[i];
+			}
+			var shape = new int[] {1,1,15};
+			var inputTensor = new DenseTensor<float>(input, shape);
+
+			var inputName = session.InputMetadata.Keys.First();
+			var outputName = session.OutputMetadata.Keys.First();
+
+			var inputs = new List<NamedOnnxValue>
+			{
+				NamedOnnxValue.CreateFromTensor(inputName, inputTensor)
+			};
+
+			using var results = session.Run(inputs);
+			var prediction = results.First().AsEnumerable<float>().ToArray();
+			GD.Print($"Predicted next value: {prediction[0]*scalarStd[4] + scalarMean[4]}");
+
 		}
 	}
  
@@ -113,6 +146,25 @@ public partial class Graph : Control
 		dataSecondaryFlow = GetEnergnistData(energnistData, 15);
 		scalarMean = GetScalars("data/scalar_means.csv");
 		scalarStd = GetScalars("data/scalar_std.csv");
+
+		try
+		{
+			session = new InferenceSession("assets/DenseModelTest.onnx");
+			GD.Print("ONNX model loaded successfully!");
+			foreach (var input in session.InputMetadata)
+			{
+				GD.Print($"Input : {input.Key}, Shape: {string.Join(",", input.Value.Dimensions)}, Type: {input.Value.ElementType}");
+			}
+			foreach (var output in session.OutputMetadata)
+			{
+				GD.Print($"Ouput: {output.Key}, Shape: {string.Join(",", output.Value.Dimensions)}, Type: {output.Value.ElementType}");
+			}
+		}
+		catch (System.Exception ex)
+		{
+			GD.PrintErr("Error loading ONNX model: ", ex.Message);
+		}
+
 	}
  
 	public override void _Draw()
@@ -288,11 +340,16 @@ public partial class Graph : Control
 		}
 
 		// Scale the envelope for the NOX limits
-		float envelopeY = Height - ((upperLimit - axisYMin) / yAxisRange) * Height;
-		envelopeY = Math.Max(0, Math.Min(Height, envelopeY));
-		if (envelopeY == 0) envelopeY = Height * 0.05f;
-		else if (envelopeY == Height) envelopeY = Height * 0.95f;
-		envelopeNOX = new Rect2(new Vector2(Margin, envelopeY), new Vector2(Width, -(Height - envelopeY)));
+		if (axisYMax < upperLimit)
+		{
+			envelopeNOX = new Rect2(new Vector2(0,0), new Vector2(0,0));
+		}
+		else
+		{
+			float envelopeY = Height - ((upperLimit - axisYMin) / yAxisRange) * Height;
+			envelopeY = Math.Max(0, Math.Min(Height, envelopeY));
+			envelopeNOX = new Rect2(new Vector2(Margin, Margin), new Vector2(Width, envelopeY));
+		}
  
 		// Update persistent x-label anchors AFTER scaling (so distances are pixel-accurate)
 		UpdateXLabelsAfterScaling();
